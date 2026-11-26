@@ -1,0 +1,2010 @@
+openapi: 3.1.0
+info:
+  title: Hisaab API
+  version: "1.0.0"
+  description: |
+    API for Hisaab — a consumer promise-tracking and escalation assistant.
+
+    **Base path**: `/api/v1`
+    **Auth**: httpOnly session cookie (`session_id`)
+    **Money**: all monetary values are integer paise (₹1 = 100 paise)
+    **IDs**: UUID v4 strings
+    **Pagination**: cursor-based (`next_cursor`, `prev_cursor`, `limit`)
+    **Idempotency**: `Idempotency-Key` header on state-changing POSTs
+
+servers:
+  - url: /api/v1
+    description: Hisaab API v1
+
+# ─────────────────────────────────────────────
+# Security
+# ─────────────────────────────────────────────
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: session_id
+
+  # ─────────────────────────────────────────────
+  # Shared parameters
+  # ─────────────────────────────────────────────
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Client-generated UUID to prevent duplicate state mutations.
+
+    CursorParam:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+      description: Opaque pagination cursor from a previous response.
+
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+      description: Page size.
+
+  # ─────────────────────────────────────────────
+  # Reusable schemas
+  # ─────────────────────────────────────────────
+  schemas:
+
+    # ── Envelope ──────────────────────────────
+    SuccessEnvelope:
+      type: object
+      required: [data, error]
+      properties:
+        data:
+          description: Response payload (shape varies per endpoint).
+        error:
+          type: "null"
+
+    ErrorEnvelope:
+      type: object
+      required: [data, error]
+      properties:
+        data:
+          type: "null"
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - AUTH_REQUIRED
+            - VALIDATION_ERROR
+            - NOT_FOUND
+            - RATE_LIMITED
+            - LLM_UNAVAILABLE
+            - GMAIL_AUTH_EXPIRED
+            - SYNC_IN_PROGRESS
+            - PROMISE_NOT_FOUND
+            - CREDIT_UPLOAD_FAILED
+            - JOB_NOT_FOUND
+            - DOSSIER_GENERATION_FAILED
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    # ── Pagination ────────────────────────────
+    PaginationMeta:
+      type: object
+      required: [next_cursor, prev_cursor, limit]
+      properties:
+        next_cursor:
+          type: [string, "null"]
+          example: "eyJpZCI6IjExMTExMTExLTAwMDMifQ=="
+        prev_cursor:
+          type: [string, "null"]
+          example: null
+        limit:
+          type: integer
+          example: 20
+
+    # ── User ──────────────────────────────────
+    UserProfile:
+      type: object
+      required: [user_id, email, display_name, is_demo, gmail_connected, created_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          example: "d4e8f012-3456-7890-abcd-ef0123456789"
+        email:
+          type: string
+          format: email
+          example: "rahul@example.com"
+        display_name:
+          type: string
+          example: "Rahul Sharma"
+        is_demo:
+          type: boolean
+          example: false
+        gmail_connected:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-11-01T10:00:00Z"
+
+    # ── Promise ───────────────────────────────
+    PromiseStatus:
+      type: string
+      enum: [pending, kept, overdue, needs_review, dismissed]
+
+    PromiseCategory:
+      type: string
+      enum: [refund, delivery_credit, insurance, ticket, other]
+
+    PromiseSummary:
+      type: object
+      required: [promise_id, merchant_name, merchant_id, category, amount_paise, status, due_date, created_at]
+      properties:
+        promise_id:
+          type: string
+          format: uuid
+          example: "11111111-0001-0000-0000-000000000001"
+        merchant_name:
+          type: string
+          example: "Flipkart"
+        merchant_id:
+          type: string
+          format: uuid
+          example: "aaaaaaaa-0001-0000-0000-000000000001"
+        category:
+          $ref: "#/components/schemas/PromiseCategory"
+        amount_paise:
+          type: integer
+          description: Promised amount in paise (1 INR = 100 paise)
+          example: 249900
+        status:
+          $ref: "#/components/schemas/PromiseStatus"
+        due_date:
+          type: string
+          format: date
+          example: "2026-11-15"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-11-01T12:00:00Z"
+
+    TimelineEvent:
+      type: object
+      required: [event_id, type, description, occurred_at]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          example: "evt-0001-0000-0000-0000-000000000001"
+        type:
+          type: string
+          enum:
+            - promise_extracted
+            - credit_matched
+            - overdue_detected
+            - escalation_advanced
+            - user_note_added
+            - status_changed
+            - verification_run
+          example: "promise_extracted"
+        description:
+          type: string
+          example: "Promise extracted from email"
+        occurred_at:
+          type: string
+          format: date-time
+          example: "2026-10-15T09:00:00Z"
+        metadata:
+          type: [object, "null"]
+          additionalProperties: true
+
+    PromiseDetail:
+      allOf:
+        - $ref: "#/components/schemas/PromiseSummary"
+        - type: object
+          required: [timeline, updated_at]
+          properties:
+            received_amount_paise:
+              type: [integer, "null"]
+              example: null
+            source_email_id:
+              type: [string, "null"]
+              example: "msg_hdfc_001"
+            source_email_subject:
+              type: [string, "null"]
+              example: "Your claim #CLM-2026-4521 has been approved"
+            user_note:
+              type: [string, "null"]
+              example: "Called helpline on Nov 12, they said processing"
+            escalation_rung:
+              type: [integer, "null"]
+              minimum: 1
+              maximum: 4
+              example: 2
+            exact_quote:
+              type: string
+              example: "Your claim #CLM-2026-4521 of Rs. 15,000 has been approved and will be credited by Nov 10, 2026."
+            confidence:
+              type: number
+              format: float
+              minimum: 0.0
+              maximum: 1.0
+              example: 0.97
+            extraction_method:
+              type: string
+              enum: [llm, deterministic]
+              example: "llm"
+            needs_review_reason:
+              type: [string, "null"]
+              example: null
+            updated_at:
+              type: string
+              format: date-time
+              example: "2026-11-20T14:30:00Z"
+            timeline:
+              type: array
+              items:
+                $ref: "#/components/schemas/TimelineEvent"
+
+    # ── Job ───────────────────────────────────
+    JobType:
+      type: string
+      enum: [gmail_sync, credit_upload, dossier_generation]
+
+    JobStatus:
+      type: string
+      enum: [queued, running, completed, failed]
+
+    Job:
+      type: object
+      required: [job_id, type, status, created_at]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          example: "aabb1234-5678-90ab-cdef-012345678901"
+        type:
+          $ref: "#/components/schemas/JobType"
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        progress_pct:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 100
+          example: 100
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-11-26T07:00:00Z"
+        completed_at:
+          type: [string, "null"]
+          format: date-time
+          example: "2026-11-26T07:04:30Z"
+        result:
+          type: [object, "null"]
+          additionalProperties: true
+        error_message:
+          type: [string, "null"]
+          example: null
+
+    # ── Credit ────────────────────────────────
+    BankCredit:
+      type: object
+      required: [credit_id, date, description, amount_paise, bank_name]
+      properties:
+        credit_id:
+          type: string
+          format: uuid
+          example: "cccc0001-0000-0000-0000-000000000001"
+        date:
+          type: string
+          format: date
+          example: "2026-11-14"
+        description:
+          type: string
+          example: "FLIPKART REFUND REF FKT2026112201"
+        amount_paise:
+          type: integer
+          example: 249900
+        reference_number:
+          type: [string, "null"]
+          example: "FKT2026112201"
+        matched_promise_id:
+          type: [string, "null"]
+          format: uuid
+          example: "11111111-0001-0000-0000-000000000001"
+        bank_name:
+          type: string
+          example: "HDFC"
+
+    # ── Escalation ────────────────────────────
+    EscalationNextStep:
+      type: object
+      required: [promise_id, next_rung, rung_name, rung_description, deadline_date, days_until_deadline]
+      properties:
+        promise_id:
+          type: string
+          format: uuid
+          example: "11111111-0002-0000-0000-000000000002"
+        current_rung:
+          type: [integer, "null"]
+          example: 2
+        next_rung:
+          type: integer
+          minimum: 1
+          maximum: 4
+          example: 3
+        rung_name:
+          type: string
+          example: "Formal Written Complaint"
+        rung_description:
+          type: string
+          example: "Send a formal complaint letter via registered post to HDFC Insurance grievance officer"
+        deadline_date:
+          type: string
+          format: date
+          example: "2026-12-10"
+        days_until_deadline:
+          type: integer
+          example: 14
+        legal_forum:
+          type: [string, "null"]
+          example: "Insurance Ombudsman"
+
+    EscalationDraft:
+      type: object
+      required: [draft_text, rung, not_legal_advice_notice, generated_at, model_used]
+      properties:
+        draft_text:
+          type: string
+          example: "Subject: Formal Complaint Regarding Pending Insurance Claim #CLM-2026-4521\n\nDear HDFC Insurance Grievance Officer,\n\nI am writing to formally escalate my claim..."
+        rung:
+          type: integer
+          example: 3
+        not_legal_advice_notice:
+          type: string
+          example: "This draft is generated by AI for reference only. It does not constitute legal advice. Please consult a qualified legal professional for advice specific to your situation."
+        generated_at:
+          type: string
+          format: date-time
+          example: "2026-11-26T07:15:00Z"
+        model_used:
+          type: string
+          example: "gemini-2.0-flash"
+
+    # ── Dashboard ─────────────────────────────
+    DashboardSummary:
+      type: object
+      required: [total_owed_paise, total_overdue_paise, total_kept_paise, counts, computed_at]
+      properties:
+        total_owed_paise:
+          type: integer
+          example: 2069900
+        total_overdue_paise:
+          type: integer
+          example: 2150000
+        total_kept_paise:
+          type: integer
+          example: 374800
+        counts:
+          type: object
+          required: [total, pending, kept, overdue, needs_review, dismissed]
+          properties:
+            total:
+              type: integer
+              example: 8
+            pending:
+              type: integer
+              example: 1
+            kept:
+              type: integer
+              example: 2
+            overdue:
+              type: integer
+              example: 2
+            needs_review:
+              type: integer
+              example: 2
+            dismissed:
+              type: integer
+              example: 1
+        computed_at:
+          type: string
+          format: date-time
+          example: "2026-11-26T07:00:00Z"
+
+    # ── Merchant ──────────────────────────────
+    MerchantRecord:
+      type: object
+      required: [merchant_id, merchant_name, total_promises, kept_count, overdue_count, dismissed_count, keep_rate_pct]
+      properties:
+        merchant_id:
+          type: string
+          format: uuid
+          example: "aaaaaaaa-0001-0000-0000-000000000001"
+        merchant_name:
+          type: string
+          example: "Flipkart"
+        total_promises:
+          type: integer
+          example: 1
+        kept_count:
+          type: integer
+          example: 1
+        overdue_count:
+          type: integer
+          example: 0
+        dismissed_count:
+          type: integer
+          example: 0
+        average_resolution_days:
+          type: [number, "null"]
+          example: 13
+        keep_rate_pct:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          example: 100.0
+
+    # ── Demo ──────────────────────────────────
+    DemoScenario:
+      type: string
+      enum: [refund_arrives, refund_delayed, fake_promise, duplicate_charge]
+
+    DemoSimulateResult:
+      type: object
+      required: [scenario, affected_promise_id, description, simulated_at]
+      properties:
+        scenario:
+          $ref: "#/components/schemas/DemoScenario"
+        affected_promise_id:
+          type: string
+          format: uuid
+          example: "11111111-0004-0000-0000-000000000004"
+        description:
+          type: string
+          example: "Zomato delivery credit of ₹149 marked as received; bank credit injected"
+        simulated_at:
+          type: string
+          format: date-time
+          example: "2026-11-26T07:30:00Z"
+
+    # ── Health ────────────────────────────────
+    HealthStatus:
+      type: object
+      required: [status, version, checks, uptime_seconds]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          example: "ok"
+        version:
+          type: string
+          example: "1.0.0"
+        checks:
+          type: object
+          required: [database, llm]
+          properties:
+            database:
+              type: string
+              enum: [ok, error]
+              example: "ok"
+            llm:
+              type: string
+              enum: [ok, degraded, error]
+              example: "ok"
+        uptime_seconds:
+          type: integer
+          example: 86400
+
+    # ── Verify ────────────────────────────────
+    VerifyResult:
+      type: object
+      required: [promise_id, previous_status, new_status, amount_paise_expected, verified_at]
+      properties:
+        promise_id:
+          type: string
+          format: uuid
+          example: "11111111-0005-0000-0000-000000000005"
+        previous_status:
+          $ref: "#/components/schemas/PromiseStatus"
+        new_status:
+          $ref: "#/components/schemas/PromiseStatus"
+        matched_credit_id:
+          type: [string, "null"]
+          format: uuid
+          example: "cccc0005-0000-0000-0000-000000000005"
+        amount_paise_expected:
+          type: integer
+          example: 320000
+        amount_paise_received:
+          type: [integer, "null"]
+          example: 290000
+        verified_at:
+          type: string
+          format: date-time
+          example: "2026-11-26T07:10:00Z"
+
+  # ─────────────────────────────────────────────
+  # Reusable responses
+  # ─────────────────────────────────────────────
+  responses:
+    AuthRequired:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            data: null
+            error:
+              code: AUTH_REQUIRED
+              message: "Session expired or not found"
+              details: {}
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+    ValidationError:
+      description: Validation error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+    RateLimited:
+      description: Rate limited
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+# ─────────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────────
+paths:
+
+  # ════════════════════════════════════════════
+  # AUTH
+  # ════════════════════════════════════════════
+
+  /auth/google/start:
+    get:
+      operationId: authGoogleStart
+      tags: [Auth]
+      summary: Start Google OAuth flow
+      description: Returns the Google authorization URL for the client to redirect to.
+      security: []
+      responses:
+        "200":
+          description: Redirect URL returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [redirect_url]
+                    properties:
+                      redirect_url:
+                        type: string
+                        format: uri
+                        example: "https://accounts.google.com/o/oauth2/v2/auth?client_id=...&scope=email+profile&state=abc123"
+                  error:
+                    type: "null"
+
+  /auth/google/callback:
+    get:
+      operationId: authGoogleCallback
+      tags: [Auth]
+      summary: Google OAuth callback
+      description: Exchanges authorization code for tokens, sets session cookie.
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+          description: OAuth authorization code from Google
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Anti-CSRF state token
+      responses:
+        "200":
+          description: User profile after successful login
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: "session_id=<token>; HttpOnly; Secure; SameSite=Lax"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/UserProfile"
+                  error:
+                    type: "null"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /auth/demo:
+    post:
+      operationId: authDemo
+      tags: [Auth]
+      summary: Create demo session
+      description: Creates or resets a seeded demo user and sets session cookie.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Demo session created
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [user_id, email, display_name, is_demo, seed_scenario]
+                    properties:
+                      user_id:
+                        type: string
+                        format: uuid
+                        example: "00000000-demo-0000-0000-000000000001"
+                      email:
+                        type: string
+                        example: "demo@hisaab.app"
+                      display_name:
+                        type: string
+                        example: "Demo User"
+                      is_demo:
+                        type: boolean
+                        example: true
+                      seed_scenario:
+                        type: string
+                        example: "v1_standard_8_promises"
+                  error:
+                    type: "null"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /auth/logout:
+    post:
+      operationId: authLogout
+      tags: [Auth]
+      summary: Logout
+      description: Destroys session and clears session cookie.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Logged out successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      logged_out:
+                        type: boolean
+                        example: true
+                  error:
+                    type: "null"
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+
+  /auth/me:
+    get:
+      operationId: authMe
+      tags: [Auth]
+      summary: Get current user
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Current user profile
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/UserProfile"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  user_id: "d4e8f012-3456-7890-abcd-ef0123456789"
+                  email: "rahul@example.com"
+                  display_name: "Rahul Sharma"
+                  is_demo: false
+                  gmail_connected: true
+                  created_at: "2026-11-01T10:00:00Z"
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+    delete:
+      operationId: authDeleteMe
+      tags: [Auth]
+      summary: Delete current user account
+      description: Revokes Gmail token, cascade deletes all user data, and clears session cookie.
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Account deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [deleted]
+                    properties:
+                      deleted:
+                        type: boolean
+                        example: true
+                  error:
+                    type: "null"
+              example:
+                data:
+                  deleted: true
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+
+  # ════════════════════════════════════════════
+  # GMAIL
+  # ════════════════════════════════════════════
+
+  /gmail/connect:
+    post:
+      operationId: gmailConnect
+      tags: [Gmail]
+      summary: Start Gmail OAuth flow
+      description: Returns Gmail OAuth redirect URL for gmail.readonly scope.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Gmail OAuth redirect URL
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [redirect_url]
+                    properties:
+                      redirect_url:
+                        type: string
+                        format: uri
+                        example: "https://accounts.google.com/o/oauth2/v2/auth?scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly&..."
+                  error:
+                    type: "null"
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+
+  /gmail/disconnect:
+    post:
+      operationId: gmailDisconnect
+      tags: [Gmail]
+      summary: Disconnect Gmail
+      description: Revokes Gmail token and purges raw email data. Keeps extracted promise data.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Gmail disconnected
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [disconnected, emails_purged]
+                    properties:
+                      disconnected:
+                        type: boolean
+                        example: true
+                      emails_purged:
+                        type: integer
+                        example: 1247
+                  error:
+                    type: "null"
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+
+  /gmail/sync:
+    post:
+      operationId: gmailSync
+      tags: [Gmail]
+      summary: Enqueue Gmail sync
+      description: Enqueues a background sync job. Returns 409 if sync is already running.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                full_resync:
+                  type: boolean
+                  default: false
+                  description: Re-process all emails, not just new ones.
+      responses:
+        "200":
+          description: Job enqueued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [job_id, status, enqueued_at]
+                    properties:
+                      job_id:
+                        type: string
+                        format: uuid
+                        example: "aabb1234-5678-90ab-cdef-012345678901"
+                      status:
+                        type: string
+                        enum: [queued, running]
+                        example: "queued"
+                      enqueued_at:
+                        type: string
+                        format: date-time
+                        example: "2026-11-26T07:00:00Z"
+                  error:
+                    type: "null"
+        "401":
+          description: AUTH_REQUIRED or GMAIL_AUTH_EXPIRED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: SYNC_IN_PROGRESS
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+              example:
+                data: null
+                error:
+                  code: SYNC_IN_PROGRESS
+                  message: "A Gmail sync is already in progress"
+                  details:
+                    job_id: "aabb1234-5678-90ab-cdef-012345678901"
+
+  /gmail/status:
+    get:
+      operationId: gmailStatus
+      tags: [Gmail]
+      summary: Get Gmail sync status
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Gmail status and sync info
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [connected, last_synced_at, sync_status, emails_processed]
+                    properties:
+                      connected:
+                        type: boolean
+                        example: true
+                      email:
+                        type: [string, "null"]
+                        format: email
+                        example: "rahul@example.com"
+                      last_synced_at:
+                        type: [string, "null"]
+                        format: date-time
+                        example: "2026-11-25T23:00:00Z"
+                      sync_status:
+                        type: string
+                        enum: [idle, queued, running]
+                        example: "idle"
+                      active_job_id:
+                        type: [string, "null"]
+                        format: uuid
+                        example: null
+                      emails_processed:
+                        type: integer
+                        example: 1247
+                  error:
+                    type: "null"
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+
+  # ════════════════════════════════════════════
+  # JOBS
+  # ════════════════════════════════════════════
+
+  /jobs/{job_id}:
+    get:
+      operationId: getJob
+      tags: [Jobs]
+      summary: Get job status
+      description: Polls status, progress, and result of any background job.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "aabb1234-5678-90ab-cdef-012345678901"
+      responses:
+        "200":
+          description: Job detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Job"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  job_id: "aabb1234-5678-90ab-cdef-012345678901"
+                  type: "gmail_sync"
+                  status: "completed"
+                  progress_pct: 100
+                  created_at: "2026-11-26T07:00:00Z"
+                  completed_at: "2026-11-26T07:04:30Z"
+                  result:
+                    emails_scanned: 1247
+                    promises_extracted: 3
+                    promises_updated: 1
+                  error_message: null
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: JOB_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+              example:
+                data: null
+                error:
+                  code: JOB_NOT_FOUND
+                  message: "No job found with the given ID"
+                  details:
+                    job_id: "aabb1234-0000-0000-0000-000000000000"
+
+  # ════════════════════════════════════════════
+  # PROMISES
+  # ════════════════════════════════════════════
+
+  /promises:
+    get:
+      operationId: listPromises
+      tags: [Promises]
+      summary: List promises
+      description: Cursor-paginated list of user promises with optional filters.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PromiseStatus"
+        - name: category
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PromiseCategory"
+        - name: merchant_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: date_from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+          example: "2026-10-01"
+        - name: date_to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+          example: "2026-11-30"
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/CursorParam"
+      responses:
+        "200":
+          description: Paginated promise list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    allOf:
+                      - type: object
+                        required: [items]
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: "#/components/schemas/PromiseSummary"
+                      - $ref: "#/components/schemas/PaginationMeta"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  items:
+                    - promise_id: "11111111-0001-0000-0000-000000000001"
+                      merchant_name: "Flipkart"
+                      merchant_id: "aaaaaaaa-0001-0000-0000-000000000001"
+                      category: "refund"
+                      amount_paise: 249900
+                      status: "kept"
+                      due_date: "2026-11-15"
+                      created_at: "2026-11-01T12:00:00Z"
+                    - promise_id: "11111111-0002-0000-0000-000000000002"
+                      merchant_name: "HDFC Insurance"
+                      merchant_id: "aaaaaaaa-0002-0000-0000-000000000002"
+                      category: "insurance"
+                      amount_paise: 1500000
+                      status: "overdue"
+                      due_date: "2026-11-10"
+                      created_at: "2026-10-15T09:00:00Z"
+                    - promise_id: "11111111-0003-0000-0000-000000000003"
+                      merchant_name: "Amazon"
+                      merchant_id: "aaaaaaaa-0003-0000-0000-000000000003"
+                      category: "refund"
+                      amount_paise: 89900
+                      status: "kept"
+                      due_date: "2026-11-12"
+                      created_at: "2026-11-02T08:00:00Z"
+                    - promise_id: "11111111-0004-0000-0000-000000000004"
+                      merchant_name: "Zomato"
+                      merchant_id: "aaaaaaaa-0004-0000-0000-000000000004"
+                      category: "delivery_credit"
+                      amount_paise: 14900
+                      status: "pending"
+                      due_date: "2026-12-01"
+                      created_at: "2026-11-24T18:00:00Z"
+                    - promise_id: "11111111-0005-0000-0000-000000000005"
+                      merchant_name: "IRCTC"
+                      merchant_id: "aaaaaaaa-0005-0000-0000-000000000005"
+                      category: "ticket"
+                      amount_paise: 320000
+                      status: "needs_review"
+                      due_date: "2026-11-20"
+                      created_at: "2026-11-05T10:00:00Z"
+                    - promise_id: "11111111-0006-0000-0000-000000000006"
+                      merchant_name: "BookMyShow"
+                      merchant_id: "aaaaaaaa-0006-0000-0000-000000000006"
+                      category: "ticket"
+                      amount_paise: 65000
+                      status: "overdue"
+                      due_date: "2026-11-18"
+                      created_at: "2026-11-10T14:00:00Z"
+                    - promise_id: "11111111-0007-0000-0000-000000000007"
+                      merchant_name: "Unknown Merchant"
+                      merchant_id: "aaaaaaaa-0007-0000-0000-000000000007"
+                      category: "other"
+                      amount_paise: 9999900
+                      status: "needs_review"
+                      due_date: "2026-11-30"
+                      created_at: "2026-11-20T11:00:00Z"
+                    - promise_id: "11111111-0008-0000-0000-000000000008"
+                      merchant_name: "Swiggy"
+                      merchant_id: "aaaaaaaa-0008-0000-0000-000000000008"
+                      category: "other"
+                      amount_paise: 50000
+                      status: "dismissed"
+                      due_date: "2026-11-20"
+                      created_at: "2026-11-05T10:00:00Z"
+                  next_cursor: null
+                  prev_cursor: null
+                  limit: 20
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /promises/{promise_id}:
+    get:
+      operationId: getPromise
+      tags: [Promises]
+      summary: Get promise detail
+      description: Full promise detail including timeline of events.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: promise_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "11111111-0002-0000-0000-000000000002"
+      responses:
+        "200":
+          description: Promise detail with timeline
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/PromiseDetail"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  promise_id: "11111111-0002-0000-0000-000000000002"
+                  merchant_name: "HDFC Insurance"
+                  merchant_id: "aaaaaaaa-0002-0000-0000-000000000002"
+                  category: "insurance"
+                  amount_paise: 1500000
+                  received_amount_paise: null
+                  status: "overdue"
+                  due_date: "2026-11-10"
+                  source_email_id: "msg_hdfc_001"
+                  source_email_subject: "Your claim #CLM-2026-4521 has been approved"
+                  user_note: "Called helpline on Nov 12, they said processing"
+                  escalation_rung: 2
+                  exact_quote: "Your claim #CLM-2026-4521 of Rs. 15,000 has been approved and will be credited by Nov 10, 2026."
+                  confidence: 0.97
+                  extraction_method: "llm"
+                  needs_review_reason: null
+                  created_at: "2026-10-15T09:00:00Z"
+                  updated_at: "2026-11-20T14:30:00Z"
+                  timeline:
+                    - event_id: "evt-0001-0000-0000-0000-000000000001"
+                      type: "promise_extracted"
+                      description: "Promise extracted from email"
+                      occurred_at: "2026-10-15T09:00:00Z"
+                      metadata:
+                        confidence_score: 0.97
+                    - event_id: "evt-0001-0000-0000-0000-000000000002"
+                      type: "overdue_detected"
+                      description: "Due date passed without matching bank credit"
+                      occurred_at: "2026-11-11T00:01:00Z"
+                      metadata: null
+                    - event_id: "evt-0001-0000-0000-0000-000000000003"
+                      type: "escalation_advanced"
+                      description: "Escalation advanced to rung 2"
+                      occurred_at: "2026-11-15T08:00:00Z"
+                      metadata:
+                        rung: 2
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: PROMISE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+    patch:
+      operationId: updatePromise
+      tags: [Promises]
+      summary: Update promise
+      description: Update promise status (dismiss) or user note.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: promise_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "11111111-0008-0000-0000-000000000008"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [dismissed]
+                  description: Only "dismissed" is user-settable.
+                user_note:
+                  type: string
+                  maxLength: 2000
+                  example: "Duplicate charge confirmed by bank"
+            example:
+              status: "dismissed"
+              user_note: "Confirmed duplicate, bank reversed the charge"
+      responses:
+        "200":
+          description: Updated promise summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/PromiseSummary"
+                  error:
+                    type: "null"
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: PROMISE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ════════════════════════════════════════════
+  # CREDITS
+  # ════════════════════════════════════════════
+
+  /credits/upload:
+    post:
+      operationId: uploadCredits
+      tags: [Credits]
+      summary: Upload bank credit CSV
+      description: Accepts multipart CSV upload of bank credits. Enqueues matching job.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, bank_name]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: "CSV file (max 10 MB). Required columns: date, description, amount, reference_number"
+                bank_name:
+                  type: string
+                  example: "HDFC"
+                account_last4:
+                  type: string
+                  maxLength: 4
+                  pattern: "^[0-9]{4}$"
+                  example: "1234"
+      responses:
+        "200":
+          description: Upload accepted, job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [job_id, rows_detected, status]
+                    properties:
+                      job_id:
+                        type: string
+                        format: uuid
+                        example: "ccdd5678-9012-34ef-ab56-78901234cdef"
+                      rows_detected:
+                        type: integer
+                        example: 42
+                      status:
+                        type: string
+                        enum: [queued]
+                        example: "queued"
+                  error:
+                    type: "null"
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "422":
+          description: CREDIT_UPLOAD_FAILED or VALIDATION_ERROR
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+              example:
+                data: null
+                error:
+                  code: CREDIT_UPLOAD_FAILED
+                  message: "CSV is missing required column: amount"
+                  details:
+                    missing_columns: ["amount"]
+
+  /credits:
+    get:
+      operationId: listCredits
+      tags: [Credits]
+      summary: List bank credits
+      description: Cursor-paginated list of uploaded bank credit records.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/CursorParam"
+        - name: matched
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Filter by whether a promise was matched
+        - name: date_from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+          example: "2026-11-01"
+        - name: date_to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+          example: "2026-11-30"
+      responses:
+        "200":
+          description: Paginated credit list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    allOf:
+                      - type: object
+                        required: [items]
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: "#/components/schemas/BankCredit"
+                      - $ref: "#/components/schemas/PaginationMeta"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  items:
+                    - credit_id: "cccc0001-0000-0000-0000-000000000001"
+                      date: "2026-11-14"
+                      description: "FLIPKART REFUND REF FKT2026112201"
+                      amount_paise: 249900
+                      reference_number: "FKT2026112201"
+                      matched_promise_id: "11111111-0001-0000-0000-000000000001"
+                      bank_name: "HDFC"
+                    - credit_id: "cccc0003-0000-0000-0000-000000000003"
+                      date: "2026-11-11"
+                      description: "AMAZON RETURNS REF AMZ89900"
+                      amount_paise: 89900
+                      reference_number: "AMZ89900"
+                      matched_promise_id: "11111111-0003-0000-0000-000000000003"
+                      bank_name: "HDFC"
+                    - credit_id: "cccc0005-0000-0000-0000-000000000005"
+                      date: "2026-11-21"
+                      description: "IRCTC REFUND PARTIAL REF IRC3200"
+                      amount_paise: 290000
+                      reference_number: "IRC3200"
+                      matched_promise_id: "11111111-0005-0000-0000-000000000005"
+                      bank_name: "SBI"
+                  next_cursor: null
+                  prev_cursor: null
+                  limit: 20
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+
+  # ════════════════════════════════════════════
+  # VERIFY
+  # ════════════════════════════════════════════
+
+  /verify/{promise_id}:
+    post:
+      operationId: verifyPromise
+      tags: [Verify]
+      summary: Re-verify promise against credits
+      description: Deterministic code-only verification pass. No LLM involved.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: promise_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "11111111-0005-0000-0000-000000000005"
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/VerifyResult"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  promise_id: "11111111-0005-0000-0000-000000000005"
+                  previous_status: "pending"
+                  new_status: "needs_review"
+                  matched_credit_id: "cccc0005-0000-0000-0000-000000000005"
+                  amount_paise_expected: 320000
+                  amount_paise_received: 290000
+                  verified_at: "2026-11-26T07:10:00Z"
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: PROMISE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  # ════════════════════════════════════════════
+  # ESCALATION
+  # ════════════════════════════════════════════
+
+  /escalation/{promise_id}/next-step:
+    get:
+      operationId: escalationNextStep
+      tags: [Escalation]
+      summary: Get next escalation step
+      description: Returns deterministic next rung and deadline math. No LLM.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: promise_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "11111111-0002-0000-0000-000000000002"
+      responses:
+        "200":
+          description: Next escalation step
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/EscalationNextStep"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  promise_id: "11111111-0002-0000-0000-000000000002"
+                  current_rung: 2
+                  next_rung: 3
+                  rung_name: "Formal Written Complaint"
+                  rung_description: "Send a formal complaint letter via registered post to HDFC Insurance grievance officer"
+                  deadline_date: "2026-12-10"
+                  days_until_deadline: 14
+                  legal_forum: "Insurance Ombudsman"
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: PROMISE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /escalation/{promise_id}/draft:
+    post:
+      operationId: escalationDraft
+      tags: [Escalation]
+      summary: Generate escalation draft
+      description: LLM-generated draft message. Always includes a not-legal-advice notice.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: promise_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "11111111-0002-0000-0000-000000000002"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rung]
+              properties:
+                rung:
+                  type: integer
+                  minimum: 1
+                  maximum: 4
+                  example: 3
+                tone:
+                  type: string
+                  enum: [firm, polite]
+                  default: firm
+                  example: "firm"
+                include_legal_references:
+                  type: boolean
+                  default: false
+                  example: true
+      responses:
+        "200":
+          description: LLM-generated escalation draft
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/EscalationDraft"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  draft_text: "Subject: Formal Complaint Regarding Pending Insurance Claim #CLM-2026-4521\n\nDear HDFC Insurance Grievance Officer,\n\nI am writing to formally escalate my claim..."
+                  rung: 3
+                  not_legal_advice_notice: "This draft is generated by AI for reference only. It does not constitute legal advice. Please consult a qualified legal professional for advice specific to your situation."
+                  generated_at: "2026-11-26T07:15:00Z"
+                  model_used: "gemini-2.0-flash"
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: PROMISE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: LLM_UNAVAILABLE
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+              example:
+                data: null
+                error:
+                  code: LLM_UNAVAILABLE
+                  message: "LLM service is temporarily unavailable"
+                  details:
+                    retry_after_seconds: 30
+
+  # ════════════════════════════════════════════
+  # DOSSIER
+  # ════════════════════════════════════════════
+
+  /dossier/{promise_id}/generate:
+    post:
+      operationId: dossierGenerate
+      tags: [Dossier]
+      summary: Enqueue dossier PDF generation
+      description: Enqueues background PDF generation. Poll /jobs/{job_id} for status.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: promise_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "11111111-0002-0000-0000-000000000002"
+      responses:
+        "200":
+          description: Dossier generation enqueued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    type: object
+                    required: [job_id, status, enqueued_at]
+                    properties:
+                      job_id:
+                        type: string
+                        format: uuid
+                        example: "ddee9012-3456-78ab-cdef-901234567890"
+                      status:
+                        type: string
+                        enum: [queued]
+                        example: "queued"
+                      enqueued_at:
+                        type: string
+                        format: date-time
+                        example: "2026-11-26T07:20:00Z"
+                  error:
+                    type: "null"
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: PROMISE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /dossier/{promise_id}/download:
+    get:
+      operationId: dossierDownload
+      tags: [Dossier]
+      summary: Download dossier PDF
+      description: Streams the generated PDF. Job must be in completed status first.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: promise_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "11111111-0002-0000-0000-000000000002"
+      responses:
+        "200":
+          description: PDF file stream
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              example: "attachment; filename=\"hisaab-dossier-11111111-0002-0000-0000-000000000002.pdf\""
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: PROMISE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "500":
+          description: DOSSIER_GENERATION_FAILED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+              example:
+                data: null
+                error:
+                  code: DOSSIER_GENERATION_FAILED
+                  message: "Dossier has not been generated yet. Please enqueue generation first."
+                  details:
+                    promise_id: "11111111-0002-0000-0000-000000000002"
+
+  # ════════════════════════════════════════════
+  # DASHBOARD
+  # ════════════════════════════════════════════
+
+  /dashboard/summary:
+    get:
+      operationId: dashboardSummary
+      tags: [Dashboard]
+      summary: Get dashboard summary
+      description: Aggregated promise statistics for the current user.
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Dashboard summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/DashboardSummary"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  total_owed_paise: 2069900
+                  total_overdue_paise: 2150000
+                  total_kept_paise: 374800
+                  counts:
+                    total: 8
+                    pending: 1
+                    kept: 2
+                    overdue: 2
+                    needs_review: 2
+                    dismissed: 1
+                  computed_at: "2026-11-26T07:00:00Z"
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+
+  # ════════════════════════════════════════════
+  # MERCHANT
+  # ════════════════════════════════════════════
+
+  /merchants/{merchant_id}/record:
+    get:
+      operationId: merchantRecord
+      tags: [Merchant]
+      summary: Get merchant promise-keeping record
+      description: Statistics on a merchant's promise fulfillment history.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: merchant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "aaaaaaaa-0001-0000-0000-000000000001"
+      responses:
+        "200":
+          description: Merchant record
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/MerchantRecord"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  merchant_id: "aaaaaaaa-0001-0000-0000-000000000001"
+                  merchant_name: "Flipkart"
+                  total_promises: 1
+                  kept_count: 1
+                  overdue_count: 0
+                  dismissed_count: 0
+                  average_resolution_days: 13
+                  keep_rate_pct: 100.0
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ════════════════════════════════════════════
+  # DEMO
+  # ════════════════════════════════════════════
+
+  /demo/simulate:
+    post:
+      operationId: demoSimulate
+      tags: [Demo]
+      summary: Simulate demo scenario
+      description: |
+        Applies a scenario mutation to the demo dataset.
+        Only works for demo accounts (`is_demo: true`).
+
+        | Scenario | Effect |
+        |---|---|
+        | `refund_arrives` | Marks pending/overdue promise as kept; injects matching bank credit |
+        | `refund_delayed` | Extends due_date and adds timeline event |
+        | `fake_promise` | Injects a needs_review promise with prompt-injection flag |
+        | `duplicate_charge` | Injects duplicate-charge promise, auto-dismisses after 2s |
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scenario]
+              properties:
+                scenario:
+                  $ref: "#/components/schemas/DemoScenario"
+                promise_id:
+                  type: string
+                  format: uuid
+                  description: Target promise; auto-selected if omitted.
+                  example: "11111111-0004-0000-0000-000000000004"
+            example:
+              scenario: "refund_arrives"
+              promise_id: "11111111-0004-0000-0000-000000000004"
+      responses:
+        "200":
+          description: Simulation applied
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/DemoSimulateResult"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  scenario: "refund_arrives"
+                  affected_promise_id: "11111111-0004-0000-0000-000000000004"
+                  description: "Zomato delivery credit of ₹149 marked as received; bank credit injected"
+                  simulated_at: "2026-11-26T07:30:00Z"
+                error: null
+        "401":
+          $ref: "#/components/responses/AuthRequired"
+        "404":
+          description: PROMISE_NOT_FOUND
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ════════════════════════════════════════════
+  # HEALTH
+  # ════════════════════════════════════════════
+
+  /health:
+    get:
+      operationId: health
+      tags: [Health]
+      summary: Health check
+      description: Liveness and readiness probe. No auth required.
+      security: []
+      responses:
+        "200":
+          description: Service health
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, error]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/HealthStatus"
+                  error:
+                    type: "null"
+              example:
+                data:
+                  status: "ok"
+                  version: "1.0.0"
+                  checks:
+                    database: "ok"
+                    llm: "ok"
+                  uptime_seconds: 86400
+                error: null
+
+# ─────────────────────────────────────────────
+# Tags
+# ─────────────────────────────────────────────
+tags:
+  - name: Auth
+    description: Session management and Google OAuth
+  - name: Gmail
+    description: Gmail connection and sync
+  - name: Jobs
+    description: Background job status polling
+  - name: Promises
+    description: Promise CRUD and listing
+  - name: Credits
+    description: Bank credit upload and listing
+  - name: Verify
+    description: Deterministic promise re-verification
+  - name: Escalation
+    description: Next-step calculation and LLM draft generation
+  - name: Dossier
+    description: PDF dossier generation and download
+  - name: Dashboard
+    description: Aggregated summary statistics
+  - name: Merchant
+    description: Merchant promise-keeping records
+  - name: Demo
+    description: Demo scenario simulation (demo accounts only)
+  - name: Health
+    description: Liveness and readiness checks
